@@ -27,47 +27,7 @@ interface AuditQuestion {
   evidence?: Evidence
 }
 
-// Mock data for demonstration
-const mockQuestions: AuditQuestion[] = [
-  {
-    id: "1",
-    number: 1,
-    text: "Does the P&P state that the MCP must respond to retrospective requests no longer than 14 calendar days from receipt?",
-    status: "met",
-    evidence: {
-      policyName: "Authorization and Processing of Referrals",
-      policyNumber: "GG.1508",
-      page: "10 of 25",
-      excerpt:
-        "For a retrospective request involving direct payment to the Member, CalOptima Health shall complete the CD, notify the Member or Member's Authorized Representative and the Prescriber, and effectuate the decision, if applicable, no later than fourteen (14) calendar days after the date and time CalOptima Health received the request.",
-    },
-  },
-  {
-    id: "2",
-    number: 2,
-    text: "Does the P&P include procedures for urgent authorization requests with a 72-hour response time?",
-    status: "met",
-    evidence: {
-      policyName: "Urgent Care Authorization Protocol",
-      policyNumber: "GG.1512",
-      page: "5 of 18",
-      excerpt:
-        "All urgent authorization requests shall be processed and a determination made within seventy-two (72) hours of receipt of the request, with notification provided to the requesting provider and member.",
-    },
-  },
-  {
-    id: "3",
-    number: 3,
-    text: "Are there documented procedures for handling appeals within the required 30-day timeframe?",
-    status: "under-review",
-  },
-  {
-    id: "4",
-    number: 4,
-    text: "Does the organization maintain a quality improvement program with quarterly reviews?",
-    status: "not-met",
-  },
-]
+// Real data will be fetched from the API
 
 export default function ComplianceAuditPage() {
   const [uploadedFile, setUploadedFile] = useState<File | null>(null)
@@ -75,16 +35,39 @@ export default function ComplianceAuditPage() {
   const [questions, setQuestions] = useState<AuditQuestion[]>([])
   const [isDragging, setIsDragging] = useState(false)
 
-  const handleFileUpload = (file: File) => {
+  const handleFileUpload = async (file: File) => {
     if (file.type === "application/pdf") {
       setUploadedFile(file)
       setIsProcessing(true)
 
-      // Simulate processing
-      setTimeout(() => {
-        setQuestions(mockQuestions)
+      try {
+        // Create form data
+        const formData = new FormData()
+        formData.append('file', file)
+
+        // Call the API
+        const response = await fetch('/api/analyze', {
+          method: 'POST',
+          body: formData,
+        })
+
+        const result = await response.json()
+
+        if (result.success) {
+          setQuestions(result.questions)
+        } else {
+          // Handle error
+          console.error('Error:', result.error)
+          alert(`Error: ${result.error || 'Failed to process PDF'}`)
+        }
+      } catch (error) {
+        console.error('Upload error:', error)
+        alert('Failed to upload file. Please try again.')
+      } finally {
         setIsProcessing(false)
-      }, 2000)
+      }
+    } else {
+      alert('Please upload a PDF file.')
     }
   }
 
