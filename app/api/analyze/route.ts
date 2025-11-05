@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server'
-import pdf from 'pdf-parse'
 import OpenAI from 'openai'
 
 // Initialize DeepSeek client using OpenAI SDK
@@ -7,6 +6,21 @@ const deepseek = new OpenAI({
   apiKey: process.env.DEEPSEEK_API_KEY,
   baseURL: 'https://api.deepseek.com/v1',
 })
+
+// PDF parsing with unpdf (reliable server-side library)
+async function parsePDF(buffer: Buffer): Promise<string> {
+  const { extractText } = await import('unpdf')
+
+  // Convert buffer to Uint8Array
+  const uint8Array = new Uint8Array(buffer)
+
+  // Extract text from PDF
+  const { text } = await extractText(uint8Array, {
+    mergePages: true,
+  })
+
+  return text
+}
 
 interface AuditQuestion {
   id: string
@@ -60,8 +74,7 @@ export async function POST(request: NextRequest) {
 
     // Extract text from PDF
     console.log('Extracting text from PDF...')
-    const pdfData = await pdf(buffer)
-    const pdfText = pdfData.text
+    const pdfText = await parsePDF(buffer)
 
     if (!pdfText || pdfText.trim().length === 0) {
       return NextResponse.json(
@@ -102,7 +115,7 @@ Return valid JSON only:`
         { role: 'user', content: extractionPrompt }
       ],
       temperature: 0.1,
-      max_tokens: 4000,
+      max_tokens: 8192,
     })
 
     const extractedContent = extractionResponse.choices[0]?.message?.content
@@ -113,7 +126,15 @@ Return valid JSON only:`
     // Parse the extracted questions
     let extractedQuestions: { number: number; text: string }[]
     try {
-      const parsed = JSON.parse(extractedContent)
+      // Strip markdown code blocks if present
+      let jsonContent = extractedContent.trim()
+      if (jsonContent.startsWith('```json')) {
+        jsonContent = jsonContent.replace(/```json\s*/, '').replace(/```\s*$/, '')
+      } else if (jsonContent.startsWith('```')) {
+        jsonContent = jsonContent.replace(/```\s*/, '').replace(/```\s*$/, '')
+      }
+
+      const parsed = JSON.parse(jsonContent.trim())
       extractedQuestions = parsed.questions || []
     } catch (e) {
       console.error('Failed to parse DeepSeek response:', extractedContent)
@@ -139,9 +160,9 @@ Return valid JSON only:`
       evidence: undefined,
     }))
 
-    // For the first 3 questions, let's try to match against policies
+    // For the first 10 questions, let's try to match against policies
     // This is a simplified version - full implementation would search all policy files
-    const questionsToMatch = auditQuestions.slice(0, Math.min(3, auditQuestions.length))
+    const questionsToMatch = auditQuestions.slice(0, Math.min(10, auditQuestions.length))
 
     for (const question of questionsToMatch) {
       try {
@@ -177,13 +198,21 @@ Return valid JSON only:`
             { role: 'user', content: matchingPrompt }
           ],
           temperature: 0.1,
-          max_tokens: 1000,
+          max_tokens: 8192,
         })
 
         const matchContent = matchingResponse.choices[0]?.message?.content
         if (matchContent) {
           try {
-            const matchResult = JSON.parse(matchContent)
+            // Strip markdown code blocks if present
+            let jsonContent = matchContent.trim()
+            if (jsonContent.startsWith('```json')) {
+              jsonContent = jsonContent.replace(/```json\s*/, '').replace(/```\s*$/, '')
+            } else if (jsonContent.startsWith('```')) {
+              jsonContent = jsonContent.replace(/```\s*/, '').replace(/```\s*$/, '')
+            }
+
+            const matchResult = JSON.parse(jsonContent.trim())
             question.status = matchResult.status || 'under-review'
             if (matchResult.evidence) {
               question.evidence = matchResult.evidence
@@ -220,8 +249,4 @@ Return valid JSON only:`
   }
 }
 
-export const config = {
-  api: {
-    bodyParser: false, // Disable body parsing, we'll handle it with formData
-  },
-}
+// Note: Body parser is automatically disabled for formData in Next.js App Router
