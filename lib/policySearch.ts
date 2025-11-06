@@ -623,9 +623,11 @@ export async function searchPoliciesForQuestions(
   console.log(`✅ All policies fetched (${allCategories.size} categories)`)
 
   // PHASE 4: Process each question with pre-fetched policies
-  console.log(`🚀 PHASE 3: Searching ${questionsToProcess.length} questions using cached policies...`)
+  // LIMIT TO FIRST 20 QUESTIONS FOR TESTING
+  const limitedSelections = categorySelections.slice(0, 20)
+  console.log(`🚀 PHASE 3: Searching ${limitedSelections.length} questions (LIMITED TO 20 FOR TESTING) using cached policies...`)
 
-  const searchPromises = categorySelections.map(async (selection) => {
+  const searchPromises = limitedSelections.map(async (selection) => {
     console.log(`   🔎 Question ${selection.questionNumber}: Using categories [${selection.categories.join(', ')}]`)
     const result = await searchPoliciesForEvidenceWithCache(
       selection.questionText,
@@ -635,7 +637,7 @@ export async function searchPoliciesForQuestions(
     return { questionNumber: selection.questionNumber, result }
   })
 
-  // Wait for all questions to finish processing
+  // Wait for all questions to finish processing (in parallel)
   const searchResults = await Promise.all(searchPromises)
 
   // Convert array results back to Map
@@ -644,7 +646,7 @@ export async function searchPoliciesForQuestions(
     results.set(questionNumber, result)
   }
 
-  console.log(`✅ Completed processing ${questionsToProcess.length} questions`)
+  console.log(`✅ Completed processing ${limitedSelections.length} questions (${categorySelections.length - limitedSelections.length} questions skipped for testing)`)
 
   return results
 }
