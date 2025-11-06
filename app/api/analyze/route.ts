@@ -84,142 +84,110 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // Phase 1: Extract questions using DeepSeek with parallel processing
-    console.log('Extracting questions with DeepSeek (parallel processing)...')
+    // Two-Pass Extraction: Fast and accurate
+    console.log('Phase 1: Scanning for question boundaries...')
 
-    // Split PDF text into chunks for parallel processing
-    const CHUNK_SIZE = 2000 // characters per chunk - smaller chunks = more parallelization = faster
-    const chunks: string[] = []
-    for (let i = 0; i < pdfText.length; i += CHUNK_SIZE) {
-      chunks.push(pdfText.slice(i, i + CHUNK_SIZE))
-    }
+    // PASS 1: Quick scan to identify question boundaries (fast, low token output)
+    const scanPrompt = `You are an expert healthcare compliance analyst. Quickly scan this PDF text and identify all question boundaries.
 
-    console.log(`Split into ${chunks.length} chunks for parallel processing`)
-
-    // Process all chunks in parallel
-    const chunkPromises = chunks.map(async (chunk, index) => {
-      const extractionPrompt = `You are an expert healthcare compliance analyst. Extract all audit questions from the provided PDF text chunk.
-
-PDF Text Chunk ${index + 1}:
-${chunk}
+PDF Text:
+${pdfText}
 
 Instructions:
-- Extract ALL compliance questions from this text chunk
-- Preserve exact wording of each question
-- Number them sequentially starting from 1 for this chunk
+- Find all question numbers (e.g., "1.", "2.", "3.")
+- For each question, provide the question number and the first 20-30 words
+- This is just a boundary scan - don't extract full questions yet
 - Return ONLY valid JSON, no additional text
-- If the chunk starts or ends mid-question, include partial questions
 
 Output Format:
 {
-  "questions": [
+  "questionBoundaries": [
     {
       "number": 1,
-      "text": "Full question text here"
+      "startText": "First 20-30 words of question..."
     }
   ]
 }
 
 Return valid JSON only:`
 
-      const stream = await deepseek.chat.completions.create({
-        model: 'deepseek-chat',
-        messages: [
-          { role: 'system', content: 'You are a healthcare compliance expert that extracts audit questions from documents.' },
-          { role: 'user', content: extractionPrompt }
-        ],
-        temperature: 0.1,
-        max_tokens: 4096,
-        stream: true,
-      })
-
-      let extractedContent = ''
-      for await (const streamChunk of stream) {
-        const content = streamChunk.choices[0]?.delta?.content
-        if (content) {
-          extractedContent += content
-        }
-      }
-
-      if (!extractedContent) {
-        throw new Error(`No response from DeepSeek for chunk ${index + 1}`)
-      }
-
-      return { index, content: extractedContent }
+    const scanResponse = await deepseek.chat.completions.create({
+      model: 'deepseek-chat',
+      messages: [
+        { role: 'system', content: 'You are a healthcare compliance expert that identifies question boundaries in documents.' },
+        { role: 'user', content: scanPrompt }
+      ],
+      temperature: 0.1,
+      max_tokens: 2048, // Low since we're just getting boundaries
     })
 
-    // Wait for all chunks to complete
-    const chunkResults = await Promise.all(chunkPromises)
-
-    // Combine all extracted questions from chunks
-    let allExtractedQuestions: { number: number; text: string }[] = []
-    for (const result of chunkResults.sort((a, b) => a.index - b.index)) {
-      try {
-        let jsonContent = result.content.trim()
-        if (jsonContent.startsWith('```json')) {
-          jsonContent = jsonContent.replace(/```json\s*/, '').replace(/```\s*$/, '')
-        } else if (jsonContent.startsWith('```')) {
-          jsonContent = jsonContent.replace(/```\s*/, '').replace(/```\s*$/, '')
-        }
-
-        const parsed = JSON.parse(jsonContent.trim())
-        const questions = parsed.questions || []
-        allExtractedQuestions = allExtractedQuestions.concat(questions)
-      } catch (e) {
-        console.error(`Failed to parse chunk ${result.index}:`, result.content)
-        // Continue with other chunks
-      }
+    const scanContent = scanResponse.choices[0]?.message?.content
+    if (!scanContent) {
+      throw new Error('No response from DeepSeek for boundary scan')
     }
 
-    // Deduplicate questions (parallel processing may create duplicates at chunk boundaries)
-    const deduplicatedQuestions: { number: number; text: string }[] = []
-    const seenTexts = new Set<string>()
-
-    for (const q of allExtractedQuestions) {
-      const normalizedText = q.text.trim().toLowerCase()
-
-      // Check for exact duplicates
-      if (seenTexts.has(normalizedText)) {
-        continue
+    // Parse question boundaries
+    let questionBoundaries: { number: number; startText: string }[] = []
+    try {
+      let jsonContent = scanContent.trim()
+      if (jsonContent.startsWith('```json')) {
+        jsonContent = jsonContent.replace(/```json\s*/, '').replace(/```\s*$/, '')
+      } else if (jsonContent.startsWith('```')) {
+        jsonContent = jsonContent.replace(/```\s*/, '').replace(/```\s*$/, '')
       }
 
-      // Check for similar questions (likely split across chunks)
-      let isDuplicate = false
-      for (const seen of seenTexts) {
-        // If texts are very similar (>80% overlap), consider it a duplicate
-        const similarity = calculateSimilarity(normalizedText, seen)
-        if (similarity > 0.8) {
-          isDuplicate = true
-          break
-        }
-      }
-
-      if (!isDuplicate) {
-        seenTexts.add(normalizedText)
-        deduplicatedQuestions.push(q)
-      }
+      const parsed = JSON.parse(jsonContent.trim())
+      questionBoundaries = parsed.questionBoundaries || []
+    } catch (e) {
+      console.error('Failed to parse boundary scan:', scanContent)
+      throw new Error('Invalid response format from AI during boundary scan')
     }
 
-    // Renumber all questions sequentially
-    const extractedQuestions = deduplicatedQuestions.map((q, idx) => ({
-      number: idx + 1,
-      text: q.text
-    }))
+    console.log(`Found ${questionBoundaries.length} question boundaries`)
+    console.log('Phase 2: Extracting questions in parallel...')
 
-    console.log(`Extracted ${allExtractedQuestions.length} questions from ${chunks.length} chunks, deduplicated to ${extractedQuestions.length} unique questions`)
+    // PASS 2: Extract each individual question in parallel (fast because parallel)
+    const extractionPromises = questionBoundaries.map(async (boundary) => {
+      // Find the text section for this question
+      const questionNumberPattern = new RegExp(`${boundary.number}\\.\\s+`, 'i')
+      const nextNumberPattern = new RegExp(`${boundary.number + 1}\\.\\s+`, 'i')
 
-    // Helper function to calculate text similarity
-    function calculateSimilarity(text1: string, text2: string): number {
-      const words1 = text1.split(/\s+/)
-      const words2 = text2.split(/\s+/)
-      const set1 = new Set(words1)
-      const set2 = new Set(words2)
+      const startIndex = pdfText.search(questionNumberPattern)
+      const endIndex = pdfText.search(nextNumberPattern)
 
-      const intersection = new Set([...set1].filter(x => set2.has(x)))
-      const union = new Set([...set1, ...set2])
+      const questionText = endIndex > startIndex
+        ? pdfText.slice(startIndex, endIndex).trim()
+        : pdfText.slice(startIndex).trim()
 
-      return intersection.size / union.size
-    }
+      const extractPrompt = `Extract the full compliance question from this text. Return only the question text, cleaned up.
+
+Text:
+${questionText.slice(0, 3000)}
+
+Return only the complete question text, nothing else:`
+
+      const response = await deepseek.chat.completions.create({
+        model: 'deepseek-chat',
+        messages: [
+          { role: 'system', content: 'You extract and clean up compliance question text.' },
+          { role: 'user', content: extractPrompt }
+        ],
+        temperature: 0.1,
+        max_tokens: 512, // Small since it's just one question
+      })
+
+      const extractedText = response.choices[0]?.message?.content?.trim() || questionText
+
+      return {
+        number: boundary.number,
+        text: extractedText
+      }
+    })
+
+    // Wait for all extractions to complete
+    const extractedQuestions = await Promise.all(extractionPromises)
+
+    console.log(`Extracted ${extractedQuestions.length} questions in parallel`)
 
     if (extractedQuestions.length === 0) {
       return NextResponse.json(
