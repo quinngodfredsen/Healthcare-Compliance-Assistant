@@ -324,7 +324,7 @@ Return valid JSON only:`
 // Batch search for multiple questions (parallel processing for speed)
 export async function searchPoliciesForQuestions(
   questions: { number: number; text: string }[],
-  maxQuestionsToProcess: number = 10
+  maxQuestionsToProcess: number
 ): Promise<Map<number, SearchResult>> {
   // Process a limited number of questions
   const questionsToProcess = questions.slice(0, maxQuestionsToProcess)
