@@ -87,11 +87,14 @@ export async function POST(request: NextRequest) {
     // Phase 1: Extract questions using DeepSeek with parallel processing
     console.log('Extracting questions with DeepSeek (parallel processing)...')
 
-    // Split PDF text into chunks for parallel processing
-    const CHUNK_SIZE = 2000 // characters per chunk - smaller chunks = more parallelization = faster
+    // Split PDF text into chunks with OVERLAP to catch questions split across boundaries
+    const CHUNK_SIZE = 3000 // Larger chunks for better context
+    const OVERLAP = 800 // Overlap ensures split questions are caught by multiple chunks
     const chunks: string[] = []
-    for (let i = 0; i < pdfText.length; i += CHUNK_SIZE) {
-      chunks.push(pdfText.slice(i, i + CHUNK_SIZE))
+    for (let i = 0; i < pdfText.length; i += CHUNK_SIZE - OVERLAP) {
+      const end = Math.min(i + CHUNK_SIZE, pdfText.length)
+      chunks.push(pdfText.slice(i, end))
+      if (end >= pdfText.length) break
     }
 
     console.log(`Split into ${chunks.length} chunks for parallel processing`)
@@ -106,9 +109,9 @@ ${chunk}
 Instructions:
 - Extract ALL compliance questions from this text chunk
 - Preserve exact wording of each question
-- Number them sequentially starting from 1 for this chunk
+- Preserve the ORIGINAL question number from the document (do NOT renumber)
 - Return ONLY valid JSON, no additional text
-- If the chunk starts or ends mid-question, include partial questions
+- Include partial questions if they appear at chunk boundaries
 
 Output Format:
 {
@@ -171,55 +174,30 @@ Return valid JSON only:`
       }
     }
 
-    // Deduplicate questions (parallel processing may create duplicates at chunk boundaries)
-    const deduplicatedQuestions: { number: number; text: string }[] = []
-    const seenTexts = new Set<string>()
+    // Deduplicate by question number (overlapping chunks may extract same question multiple times)
+    // Keep the longest/most complete version of each question
+    const questionMap = new Map<number, { text: string; length: number }>()
 
     for (const q of allExtractedQuestions) {
-      const normalizedText = q.text.trim().toLowerCase()
+      const existing = questionMap.get(q.number)
 
-      // Check for exact duplicates
-      if (seenTexts.has(normalizedText)) {
-        continue
-      }
-
-      // Check for similar questions (likely split across chunks)
-      let isDuplicate = false
-      for (const seen of seenTexts) {
-        // If texts are very similar (>80% overlap), consider it a duplicate
-        const similarity = calculateSimilarity(normalizedText, seen)
-        if (similarity > 0.8) {
-          isDuplicate = true
-          break
+      if (!existing) {
+        // First time seeing this question number
+        questionMap.set(q.number, { text: q.text, length: q.text.length })
+      } else {
+        // Already have this question - keep the longer/more complete version
+        if (q.text.length > existing.length) {
+          questionMap.set(q.number, { text: q.text, length: q.text.length })
         }
       }
-
-      if (!isDuplicate) {
-        seenTexts.add(normalizedText)
-        deduplicatedQuestions.push(q)
-      }
     }
 
-    // Renumber all questions sequentially
-    const extractedQuestions = deduplicatedQuestions.map((q, idx) => ({
-      number: idx + 1,
-      text: q.text
-    }))
+    // Convert to array and sort by question number
+    const extractedQuestions = Array.from(questionMap.entries())
+      .map(([number, data]) => ({ number, text: data.text }))
+      .sort((a, b) => a.number - b.number)
 
     console.log(`Extracted ${allExtractedQuestions.length} questions from ${chunks.length} chunks, deduplicated to ${extractedQuestions.length} unique questions`)
-
-    // Helper function to calculate text similarity
-    function calculateSimilarity(text1: string, text2: string): number {
-      const words1 = text1.split(/\s+/)
-      const words2 = text2.split(/\s+/)
-      const set1 = new Set(words1)
-      const set2 = new Set(words2)
-
-      const intersection = new Set([...set1].filter(x => set2.has(x)))
-      const union = new Set([...set1, ...set2])
-
-      return intersection.size / union.size
-    }
 
     if (extractedQuestions.length === 0) {
       return NextResponse.json(
