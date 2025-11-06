@@ -36,6 +36,25 @@ interface PolicyDocument {
   file_size?: number
 }
 
+// Simple in-memory cache for policy analysis results
+interface CachedResult {
+  found: boolean
+  excerpt?: string
+  confidence?: number
+  reasoning?: string
+  timestamp: number
+}
+
+const policyAnalysisCache = new Map<string, CachedResult>()
+const CACHE_TTL = 1000 * 60 * 60 // 1 hour cache lifetime
+
+// Generate cache key from question and policy
+function getCacheKey(question: string, policyId: string): string {
+  // Use first 100 chars of question to create a reasonable cache key
+  const questionKey = question.substring(0, 100).toLowerCase().trim()
+  return `${questionKey}:${policyId}`
+}
+
 // Category descriptions for intelligent routing
 const CATEGORY_DESCRIPTIONS = {
   AA: 'Administration - General administrative policies, glossaries, definitions',
@@ -168,6 +187,21 @@ export async function searchPoliciesForEvidence(
       if (!policy.content || policy.content.length < 100) return null
 
       try {
+        // Check cache first
+        const cacheKey = getCacheKey(question, policy.id)
+        const cached = policyAnalysisCache.get(cacheKey)
+
+        if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
+          // Use cached result
+          if (cached.found && cached.confidence && cached.confidence > 0.6) {
+            return {
+              policy,
+              result: cached
+            }
+          }
+          return null
+        }
+
         // Use AI to check if this policy contains evidence for the question
         const maxChars = 15000 // Keep within token limits
         const policyChunk = policy.content.substring(0, maxChars)
@@ -220,6 +254,15 @@ Return valid JSON only:`
 
         const result = JSON.parse(jsonContent.trim())
 
+        // Cache the result
+        policyAnalysisCache.set(cacheKey, {
+          found: result.found,
+          excerpt: result.excerpt,
+          confidence: result.confidence,
+          reasoning: result.reasoning,
+          timestamp: Date.now()
+        })
+
         if (result.found && result.confidence > 0.6) {
           return {
             policy,
@@ -234,28 +277,25 @@ Return valid JSON only:`
       }
     }
 
-    // Create all batch promises upfront (process ALL batches in parallel)
-    const batchSize = 10 // Increased from 5 since we're processing in parallel
-    const allBatchPromises: Promise<any>[] = []
+    // Process policies in batches with early exit optimization
+    const batchSize = 25 // Increased batch size for better throughput
+    let policiesSearched = 0
 
     for (let i = 0; i < policies.length; i += batchSize) {
       const batch = policies.slice(i, i + batchSize)
+      const batchNumber = Math.floor(i / batchSize) + 1
+      const totalBatches = Math.ceil(policies.length / batchSize)
 
-      // Create a promise for this entire batch
-      const batchPromise = Promise.all(batch.map(processPolicy))
-      allBatchPromises.push(batchPromise)
-    }
+      console.log(`🔍 Processing batch ${batchNumber}/${totalBatches} (${batch.length} policies)...`)
 
-    console.log(`🚀 Processing ${allBatchPromises.length} batches in parallel...`)
+      // Process entire batch in parallel
+      const batchResults = await Promise.all(batch.map(processPolicy))
+      policiesSearched += batch.length
 
-    // Process all batches in parallel and return as soon as we find a match
-    const allBatchesResults = await Promise.all(allBatchPromises)
-
-    // Flatten results and check for matches
-    for (const batchResults of allBatchesResults) {
+      // Check if we found a match in this batch
       for (const match of batchResults) {
         if (match) {
-          console.log(`✅ Found match in policy ${match.policy.policy_number}`)
+          console.log(`✅ Found match in policy ${match.policy.policy_number} after searching ${policiesSearched}/${policies.length} policies`)
           return {
             status: 'met',
             evidence: {
@@ -272,7 +312,7 @@ Return valid JSON only:`
     }
 
     // If we searched through all policies and found nothing
-    console.log(`❌ No matches found in ${policies.length} policies`)
+    console.log(`❌ No matches found after searching all ${policiesSearched} policies`)
     return { status: 'not-met' }
 
   } catch (error) {

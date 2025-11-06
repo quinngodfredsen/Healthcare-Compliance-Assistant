@@ -162,9 +162,9 @@ Return valid JSON only:`
       evidence: undefined,
     }))
 
-    // Search through policy documents for the first 10 questions
-    // (Searching all 373 policies for all questions would be slow)
-    const searchResults = await searchPoliciesForQuestions(extractedQuestions, 10)
+    // Search through policy documents for all questions
+    // With optimizations (early exit, caching, AI category selection), this is now feasible
+    const searchResults = await searchPoliciesForQuestions(extractedQuestions, extractedQuestions.length)
 
     // Update questions with search results
     for (const question of auditQuestions) {
