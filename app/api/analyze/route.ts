@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import OpenAI from 'openai'
+import { searchPoliciesForQuestions } from '@/lib/policySearch'
 
 // Initialize DeepSeek client using OpenAI SDK
 const deepseek = new OpenAI({
@@ -148,10 +149,11 @@ Return valid JSON only:`
       )
     }
 
-    // Phase 2: For demonstration, we'll mark questions as "under-review" by default
-    // In production, this would match against policy documents
+    // Phase 2: Search through actual policy documents for evidence
     console.log(`Processing ${extractedQuestions.length} questions...`)
+    console.log('Searching policy documents for evidence...')
 
+    // Initialize all questions as under-review
     const auditQuestions: AuditQuestion[] = extractedQuestions.map((q) => ({
       id: `q-${q.number}`,
       number: q.number,
@@ -160,71 +162,24 @@ Return valid JSON only:`
       evidence: undefined,
     }))
 
-    // For the first 10 questions, let's try to match against policies
-    // This is a simplified version - full implementation would search all policy files
-    const questionsToMatch = auditQuestions.slice(0, Math.min(10, auditQuestions.length))
+    // Search through policy documents for the first 10 questions
+    // (Searching all 373 policies for all questions would be slow)
+    const searchResults = await searchPoliciesForQuestions(extractedQuestions, 10)
 
-    for (const question of questionsToMatch) {
-      try {
-        const matchingPrompt = `You are a healthcare policy expert. Analyze if this audit question can be answered based on typical healthcare compliance policies.
-
-Audit Question:
-"${question.text}"
-
-Instructions:
-- Determine if this requirement would typically be met by standard healthcare policies
-- If likely met, provide a realistic policy reference
-- Return ONLY valid JSON, no additional text
-
-Output Format:
-{
-  "status": "met" | "not-met" | "under-review",
-  "evidence": {
-    "policyName": "Example Policy Name",
-    "policyNumber": "XX.####",
-    "page": "Page reference",
-    "excerpt": "Relevant policy excerpt (max 200 chars)",
-    "confidence": 0.85
-  }
-}
-
-If you cannot determine compliance, return status "under-review" with no evidence.
-Return valid JSON only:`
-
-        const matchingResponse = await deepseek.chat.completions.create({
-          model: 'deepseek-chat',
-          messages: [
-            { role: 'system', content: 'You are a healthcare policy expert.' },
-            { role: 'user', content: matchingPrompt }
-          ],
-          temperature: 0.1,
-          max_tokens: 8192,
-        })
-
-        const matchContent = matchingResponse.choices[0]?.message?.content
-        if (matchContent) {
-          try {
-            // Strip markdown code blocks if present
-            let jsonContent = matchContent.trim()
-            if (jsonContent.startsWith('```json')) {
-              jsonContent = jsonContent.replace(/```json\s*/, '').replace(/```\s*$/, '')
-            } else if (jsonContent.startsWith('```')) {
-              jsonContent = jsonContent.replace(/```\s*/, '').replace(/```\s*$/, '')
-            }
-
-            const matchResult = JSON.parse(jsonContent.trim())
-            question.status = matchResult.status || 'under-review'
-            if (matchResult.evidence) {
-              question.evidence = matchResult.evidence
-            }
-          } catch (e) {
-            console.error('Failed to parse matching response:', e)
-            // Keep as under-review if parsing fails
+    // Update questions with search results
+    for (const question of auditQuestions) {
+      const result = searchResults.get(question.number)
+      if (result) {
+        question.status = result.status
+        if (result.evidence) {
+          question.evidence = {
+            policyName: result.evidence.policyName,
+            policyNumber: result.evidence.policyNumber,
+            page: result.evidence.page,
+            excerpt: result.evidence.excerpt,
+            confidence: result.evidence.confidence,
           }
         }
-      } catch (error) {
-        console.error(`Error matching question ${question.number}:`, error)
-        // Keep as under-review if matching fails
       }
     }
 
