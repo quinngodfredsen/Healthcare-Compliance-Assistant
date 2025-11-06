@@ -88,7 +88,7 @@ export async function POST(request: NextRequest) {
     console.log('Extracting questions with DeepSeek (parallel processing)...')
 
     // Split PDF text into chunks for parallel processing
-    const CHUNK_SIZE = 5000 // characters per chunk
+    const CHUNK_SIZE = 2000 // characters per chunk - smaller chunks = more parallelization = faster
     const chunks: string[] = []
     for (let i = 0; i < pdfText.length; i += CHUNK_SIZE) {
       chunks.push(pdfText.slice(i, i + CHUNK_SIZE))
