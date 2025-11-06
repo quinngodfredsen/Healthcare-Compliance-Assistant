@@ -68,7 +68,7 @@ Once local testing works:
 4. Add these three variables:
    - `DEEPSEEK_API_KEY`: `<your-deepseek-api-key>`
    - `NEXT_PUBLIC_SUPABASE_URL`: `https://ljhfhhvaxklmkotzwsmz.supabase.co`
-   - `NEXT_PUBLIC_SUPABASE_ANON_KEY`: `eyJhbGc...` (the long key)
+   - `NEXT_PUBLIC_SUPABASE_ANON_KEY`: `<your-supabase-anon-key>`
 5. Select: **Production**, **Preview**, **Development**
 6. Click **Save**
 7. Go to **Deployments** → **Redeploy** latest deployment
