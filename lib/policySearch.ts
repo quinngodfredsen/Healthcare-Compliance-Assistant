@@ -42,6 +42,7 @@ interface CachedResult {
   excerpt?: string
   confidence?: number
   reasoning?: string
+  pageNumber?: string
   timestamp: number
 }
 
@@ -53,6 +54,50 @@ function getCacheKey(question: string, policyId: string): string {
   // Use first 100 chars of question to create a reasonable cache key
   const questionKey = question.substring(0, 100).toLowerCase().trim()
   return `${questionKey}:${policyId}`
+}
+
+// Parse policy content into page chunks
+interface PageChunk {
+  pageNumber: string // e.g., "10 of 25"
+  content: string
+  startIndex: number
+}
+
+function parsePolicyIntoPages(content: string): PageChunk[] {
+  // Look for "Page X of Y" markers
+  const pageRegex = /Page (\d+) of (\d+)/gi
+  const matches = Array.from(content.matchAll(pageRegex))
+
+  if (matches.length === 0) {
+    // No page markers found, return entire content as single chunk
+    return [{
+      pageNumber: '1',
+      content: content,
+      startIndex: 0
+    }]
+  }
+
+  const chunks: PageChunk[] = []
+
+  for (let i = 0; i < matches.length; i++) {
+    const match = matches[i]
+    const pageNum = match[1]
+    const totalPages = match[2]
+    const startIndex = match.index || 0
+
+    // Get content from this page marker to the next (or end of document)
+    const nextMatch = matches[i + 1]
+    const endIndex = nextMatch ? (nextMatch.index || content.length) : content.length
+    const pageContent = content.substring(startIndex, endIndex)
+
+    chunks.push({
+      pageNumber: `${pageNum} of ${totalPages}`,
+      content: pageContent,
+      startIndex: startIndex
+    })
+  }
+
+  return chunks
 }
 
 // Category descriptions for intelligent routing
@@ -202,20 +247,29 @@ export async function searchPoliciesForEvidence(
           return null
         }
 
-        // Use AI to check if this policy contains evidence for the question
-        const maxChars = 15000 // Keep within token limits
-        const policyChunk = policy.content.substring(0, maxChars)
+        // Parse policy into page chunks
+        const pageChunks = parsePolicyIntoPages(policy.content)
 
-        const searchPrompt = `You are a healthcare compliance expert. Analyze if this policy document contains evidence that answers the audit question.
+        // Search through pages until we find evidence
+        for (const page of pageChunks) {
+          // Limit page content to token limits
+          const maxChars = 15000
+          const pageContent = page.content.length > maxChars
+            ? page.content.substring(0, maxChars) + '\n...(content truncated)'
+            : page.content
+
+          const searchPrompt = `You are a healthcare compliance expert. Analyze if this page from a policy document contains evidence that answers the audit question.
 
 Audit Question:
 "${question}"
 
 Policy Document (${policy.policy_name}):
-${policyChunk}
+Page ${page.pageNumber}
+
+${pageContent}
 
 Instructions:
-- Determine if this policy contains specific evidence that answers the question
+- Determine if this page contains specific evidence that answers the question
 - If evidence is found, extract the EXACT relevant excerpt (max 250 characters)
 - Rate your confidence (0.0 to 1.0)
 - Return ONLY valid JSON, no additional text
@@ -231,44 +285,54 @@ Output Format:
 If no evidence found, return: {"found": false}
 Return valid JSON only:`
 
-        const response = await deepseek.chat.completions.create({
-          model: 'deepseek-chat',
-          messages: [
-            { role: 'system', content: 'You are a healthcare policy compliance expert.' },
-            { role: 'user', content: searchPrompt }
-          ],
-          temperature: 0.1,
-          max_tokens: 1000,
-        })
+          const response = await deepseek.chat.completions.create({
+            model: 'deepseek-chat',
+            messages: [
+              { role: 'system', content: 'You are a healthcare policy compliance expert.' },
+              { role: 'user', content: searchPrompt }
+            ],
+            temperature: 0.1,
+            max_tokens: 1000,
+          })
 
-        const content = response.choices[0]?.message?.content
-        if (!content) return null
+          const content = response.choices[0]?.message?.content
+          if (!content) continue
 
-        // Parse AI response
-        let jsonContent = content.trim()
-        if (jsonContent.startsWith('```json')) {
-          jsonContent = jsonContent.replace(/```json\s*/, '').replace(/```\s*$/, '')
-        } else if (jsonContent.startsWith('```')) {
-          jsonContent = jsonContent.replace(/```\s*/, '').replace(/```\s*$/, '')
-        }
+          // Parse AI response
+          let jsonContent = content.trim()
+          if (jsonContent.startsWith('```json')) {
+            jsonContent = jsonContent.replace(/```json\s*/, '').replace(/```\s*$/, '')
+          } else if (jsonContent.startsWith('```')) {
+            jsonContent = jsonContent.replace(/```\s*/, '').replace(/```\s*$/, '')
+          }
 
-        const result = JSON.parse(jsonContent.trim())
+          const result = JSON.parse(jsonContent.trim())
 
-        // Cache the result
-        policyAnalysisCache.set(cacheKey, {
-          found: result.found,
-          excerpt: result.excerpt,
-          confidence: result.confidence,
-          reasoning: result.reasoning,
-          timestamp: Date.now()
-        })
+          if (result.found && result.confidence > 0.6) {
+            // Cache the result with page information
+            const cachedResult = {
+              found: true,
+              excerpt: result.excerpt,
+              confidence: result.confidence,
+              reasoning: result.reasoning,
+              pageNumber: page.pageNumber,
+              timestamp: Date.now()
+            }
 
-        if (result.found && result.confidence > 0.6) {
-          return {
-            policy,
-            result
+            policyAnalysisCache.set(cacheKey, cachedResult)
+
+            return {
+              policy,
+              result: cachedResult
+            }
           }
         }
+
+        // No evidence found in any page, cache negative result
+        policyAnalysisCache.set(cacheKey, {
+          found: false,
+          timestamp: Date.now()
+        })
 
         return null
       } catch (e) {
@@ -295,13 +359,16 @@ Return valid JSON only:`
       // Check if we found a match in this batch
       for (const match of batchResults) {
         if (match) {
-          console.log(`✅ Found match in policy ${match.policy.policy_number} after searching ${policiesSearched}/${policies.length} policies`)
+          const pageInfo = match.result.pageNumber
+            ? `Page ${match.result.pageNumber}`
+            : 'Various'
+          console.log(`✅ Found match in policy ${match.policy.policy_number} (${pageInfo}) after searching ${policiesSearched}/${policies.length} policies`)
           return {
             status: 'met',
             evidence: {
               policyName: match.policy.policy_name,
               policyNumber: match.policy.policy_number,
-              page: 'Various', // Could enhance to find specific page
+              page: pageInfo,
               excerpt: match.result.excerpt || 'Evidence found in policy document',
               confidence: match.result.confidence,
               category: match.policy.policy_category,
