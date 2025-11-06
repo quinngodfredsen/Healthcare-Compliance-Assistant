@@ -388,7 +388,194 @@ Return valid JSON only:`
   }
 }
 
-// Batch search for multiple questions (parallel processing for speed)
+// OPTIMIZED: Search with shared policy fetching to reduce database load
+async function searchPoliciesForEvidenceWithCache(
+  question: string,
+  policiesByCategory: Map<string, PolicyDocument[]>,
+  selectedCategories: string[]
+): Promise<SearchResult> {
+  try {
+    // Get pre-fetched policies for this question's categories
+    const relevantPolicies: PolicyDocument[] = []
+    for (const category of selectedCategories) {
+      const categoryPolicies = policiesByCategory.get(category) || []
+      relevantPolicies.push(...categoryPolicies)
+    }
+
+    // Remove duplicates (some policies might be in multiple categories)
+    const uniquePolicies = Array.from(
+      new Map(relevantPolicies.map(p => [p.id, p])).values()
+    )
+
+    if (uniquePolicies.length === 0) {
+      console.log('No policies found in selected categories')
+      return { status: 'under-review' }
+    }
+
+    console.log(`Searching ${uniquePolicies.length} policies from categories [${selectedCategories.join(', ')}]...`)
+
+    // Helper function to process a single policy (same as before)
+    const processPolicy = async (policy: PolicyDocument) => {
+      if (!policy.content || policy.content.length < 100) return null
+
+      try {
+        // Check cache first
+        const cacheKey = getCacheKey(question, policy.id)
+        const cached = policyAnalysisCache.get(cacheKey)
+
+        if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
+          // Use cached result
+          if (cached.found && cached.confidence && cached.confidence > 0.6) {
+            return {
+              policy,
+              result: cached
+            }
+          }
+          return null
+        }
+
+        // Parse policy into page chunks
+        const pageChunks = parsePolicyIntoPages(policy.content)
+
+        // Search through pages until we find evidence
+        for (const page of pageChunks) {
+          // Limit page content to token limits
+          const maxChars = 15000
+          const pageContent = page.content.length > maxChars
+            ? page.content.substring(0, maxChars) + '\n...(content truncated)'
+            : page.content
+
+          const searchPrompt = `You are a healthcare compliance expert. Analyze if this page from a policy document contains evidence that answers the audit question.
+
+Audit Question:
+"${question}"
+
+Policy Document (${policy.policy_name}):
+Page ${page.pageNumber}
+
+${pageContent}
+
+Instructions:
+- Determine if this page contains specific evidence that answers the question
+- If evidence is found, extract the EXACT relevant excerpt (max 250 characters)
+- Rate your confidence (0.0 to 1.0)
+- Return ONLY valid JSON, no additional text
+
+Output Format:
+{
+  "found": true/false,
+  "excerpt": "exact quote from policy if found",
+  "confidence": 0.85,
+  "reasoning": "brief explanation"
+}
+
+If no evidence found, return: {"found": false}
+Return valid JSON only:`
+
+          const response = await deepseek.chat.completions.create({
+            model: 'deepseek-chat',
+            messages: [
+              { role: 'system', content: 'You are a healthcare policy compliance expert.' },
+              { role: 'user', content: searchPrompt }
+            ],
+            temperature: 0.1,
+            max_tokens: 1000,
+          })
+
+          const content = response.choices[0]?.message?.content
+          if (!content) continue
+
+          // Parse AI response
+          let jsonContent = content.trim()
+          if (jsonContent.startsWith('```json')) {
+            jsonContent = jsonContent.replace(/```json\s*/, '').replace(/```\s*$/, '')
+          } else if (jsonContent.startsWith('```')) {
+            jsonContent = jsonContent.replace(/```\s*/, '').replace(/```\s*$/, '')
+          }
+
+          const result = JSON.parse(jsonContent.trim())
+
+          if (result.found && result.confidence > 0.6) {
+            // Cache the result with page information
+            const cachedResult = {
+              found: true,
+              excerpt: result.excerpt,
+              confidence: result.confidence,
+              reasoning: result.reasoning,
+              pageNumber: page.pageNumber,
+              timestamp: Date.now()
+            }
+
+            policyAnalysisCache.set(cacheKey, cachedResult)
+
+            return {
+              policy,
+              result: cachedResult
+            }
+          }
+        }
+
+        // No evidence found in any page, cache negative result
+        policyAnalysisCache.set(cacheKey, {
+          found: false,
+          timestamp: Date.now()
+        })
+
+        return null
+      } catch (e) {
+        console.error('Error processing policy:', e)
+        return null
+      }
+    }
+
+    // Process policies in batches with early exit optimization
+    const batchSize = 25
+    let policiesSearched = 0
+
+    for (let i = 0; i < uniquePolicies.length; i += batchSize) {
+      const batch = uniquePolicies.slice(i, i + batchSize)
+      const batchNumber = Math.floor(i / batchSize) + 1
+      const totalBatches = Math.ceil(uniquePolicies.length / batchSize)
+
+      console.log(`🔍 Processing batch ${batchNumber}/${totalBatches} (${batch.length} policies)...`)
+
+      // Process entire batch in parallel
+      const batchResults = await Promise.all(batch.map(processPolicy))
+      policiesSearched += batch.length
+
+      // Check if we found a match in this batch
+      for (const match of batchResults) {
+        if (match) {
+          const pageInfo = match.result.pageNumber
+            ? `Page ${match.result.pageNumber}`
+            : 'Various'
+          console.log(`✅ Found match in policy ${match.policy.policy_number} (${pageInfo}) after searching ${policiesSearched}/${uniquePolicies.length} policies`)
+          return {
+            status: 'met',
+            evidence: {
+              policyName: match.policy.policy_name,
+              policyNumber: match.policy.policy_number,
+              page: pageInfo,
+              excerpt: match.result.excerpt || 'Evidence found in policy document',
+              confidence: match.result.confidence,
+              category: match.policy.policy_category,
+            }
+          }
+        }
+      }
+    }
+
+    // If we searched through all policies and found nothing
+    console.log(`❌ No matches found after searching all ${policiesSearched} policies`)
+    return { status: 'not-met' }
+
+  } catch (error) {
+    console.error('Error searching policies:', error)
+    return { status: 'under-review' }
+  }
+}
+
+// Batch search for multiple questions (OPTIMIZED for shared policy fetching)
 export async function searchPoliciesForQuestions(
   questions: { number: number; text: string }[],
   maxQuestionsToProcess: number
@@ -396,13 +583,56 @@ export async function searchPoliciesForQuestions(
   // Process a limited number of questions
   const questionsToProcess = questions.slice(0, maxQuestionsToProcess)
 
-  console.log(`🚀 Processing ${questionsToProcess.length} questions in parallel...`)
+  console.log(`🚀 PHASE 1: Determining categories for ${questionsToProcess.length} questions...`)
 
-  // Process all questions in parallel using Promise.all
-  const searchPromises = questionsToProcess.map(async (question) => {
-    console.log(`Searching for evidence for question ${question.number}...`)
-    const result = await searchPoliciesForEvidence(question.text) // AI selects relevant categories automatically
-    return { questionNumber: question.number, result }
+  // PHASE 1: Determine categories for ALL questions in parallel
+  const categorySelections = await Promise.all(
+    questionsToProcess.map(async (question) => {
+      const categories = await selectRelevantCategories(question.text)
+      return {
+        questionNumber: question.number,
+        questionText: question.text,
+        categories
+      }
+    })
+  )
+
+  console.log(`✅ Categories determined for all questions`)
+
+  // PHASE 2: Identify all unique categories needed
+  const allCategories = new Set<string>()
+  for (const selection of categorySelections) {
+    for (const category of selection.categories) {
+      allCategories.add(category)
+    }
+  }
+
+  console.log(`🚀 PHASE 2: Fetching policies for ${allCategories.size} unique categories: [${Array.from(allCategories).join(', ')}]`)
+
+  // PHASE 3: Fetch each category's policies ONCE
+  const policiesByCategory = new Map<string, PolicyDocument[]>()
+
+  await Promise.all(
+    Array.from(allCategories).map(async (category) => {
+      const policies = await getAllPolicyDocuments(undefined, [category])
+      policiesByCategory.set(category, policies)
+      console.log(`   📁 Fetched ${policies.length} policies for category ${category}`)
+    })
+  )
+
+  console.log(`✅ All policies fetched (${allCategories.size} categories)`)
+
+  // PHASE 4: Process each question with pre-fetched policies
+  console.log(`🚀 PHASE 3: Searching ${questionsToProcess.length} questions using cached policies...`)
+
+  const searchPromises = categorySelections.map(async (selection) => {
+    console.log(`   🔎 Question ${selection.questionNumber}: Using categories [${selection.categories.join(', ')}]`)
+    const result = await searchPoliciesForEvidenceWithCache(
+      selection.questionText,
+      policiesByCategory,
+      selection.categories
+    )
+    return { questionNumber: selection.questionNumber, result }
   })
 
   // Wait for all questions to finish processing
