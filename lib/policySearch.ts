@@ -4,6 +4,8 @@ import OpenAI from 'openai'
 const deepseek = new OpenAI({
   apiKey: process.env.DEEPSEEK_API_KEY,
   baseURL: 'https://api.deepseek.com/v1',
+  maxRetries: 3,
+  timeout: 60000, // 60 second timeout
 })
 
 // Initialize Supabase client
@@ -48,6 +50,57 @@ interface CachedResult {
 
 const policyAnalysisCache = new Map<string, CachedResult>()
 const CACHE_TTL = 1000 * 60 * 60 // 1 hour cache lifetime
+
+// Concurrency limiter for parallel operations
+async function processConcurrently<T, R>(
+  items: T[],
+  processor: (item: T) => Promise<R>,
+  concurrency: number
+): Promise<R[]> {
+  const results: R[] = []
+
+  for (let i = 0; i < items.length; i += concurrency) {
+    const batch = items.slice(i, i + concurrency)
+    const batchResults = await Promise.all(batch.map(processor))
+    results.push(...batchResults)
+  }
+
+  return results
+}
+
+// Retry function with exponential backoff
+async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  maxRetries: number = 3,
+  baseDelay: number = 1000
+): Promise<T> {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await fn()
+    } catch (error: any) {
+      const isLastAttempt = attempt === maxRetries - 1
+      const isRetryableError =
+        error?.code === 'UND_ERR_SOCKET' ||
+        error?.code === 'ECONNRESET' ||
+        error?.message?.includes('terminated') ||
+        error?.message?.includes('socket') ||
+        error?.status === 429 || // Rate limit
+        error?.status === 503 || // Service unavailable
+        error?.status === 504    // Gateway timeout
+
+      if (isLastAttempt || !isRetryableError) {
+        throw error
+      }
+
+      // Exponential backoff with jitter
+      const delay = baseDelay * Math.pow(2, attempt) + Math.random() * 1000
+      console.log(`   ⚠️ Retrying after ${Math.round(delay)}ms (attempt ${attempt + 1}/${maxRetries})...`)
+      await new Promise(resolve => setTimeout(resolve, delay))
+    }
+  }
+
+  throw new Error('Max retries exceeded')
+}
 
 // Generate cache key from question and policy
 function getCacheKey(question: string, policyId: string): string {
@@ -140,15 +193,17 @@ Output Format:
 
 Return JSON array only:`
 
-    const response = await deepseek.chat.completions.create({
-      model: 'deepseek-chat',
-      messages: [
-        { role: 'system', content: 'You are a healthcare policy compliance expert.' },
-        { role: 'user', content: selectionPrompt }
-      ],
-      temperature: 0.1,
-      max_tokens: 100,
-    })
+    const response = await retryWithBackoff(() =>
+      deepseek.chat.completions.create({
+        model: 'deepseek-chat',
+        messages: [
+          { role: 'system', content: 'You are a healthcare policy compliance expert.' },
+          { role: 'user', content: selectionPrompt }
+        ],
+        temperature: 0.1,
+        max_tokens: 100,
+      })
+    )
 
     const content = response.choices[0]?.message?.content
     if (!content) return ['GG', 'HH', 'MA'] // Fallback to broad categories
@@ -285,15 +340,17 @@ Output Format:
 If no evidence found, return: {"found": false}
 Return valid JSON only:`
 
-          const response = await deepseek.chat.completions.create({
-            model: 'deepseek-chat',
-            messages: [
-              { role: 'system', content: 'You are a healthcare policy compliance expert.' },
-              { role: 'user', content: searchPrompt }
-            ],
-            temperature: 0.1,
-            max_tokens: 1000,
-          })
+          const response = await retryWithBackoff(() =>
+            deepseek.chat.completions.create({
+              model: 'deepseek-chat',
+              messages: [
+                { role: 'system', content: 'You are a healthcare policy compliance expert.' },
+                { role: 'user', content: searchPrompt }
+              ],
+              temperature: 0.1,
+              max_tokens: 1000,
+            })
+          )
 
           const content = response.choices[0]?.message?.content
           if (!content) continue
@@ -342,7 +399,7 @@ Return valid JSON only:`
     }
 
     // Process policies in batches with early exit optimization
-    const batchSize = 25 // Increased batch size for better throughput
+    const batchSize = 10 // Reduced to prevent connection overload // Increased batch size for better throughput
     let policiesSearched = 0
 
     for (let i = 0; i < policies.length; i += batchSize) {
@@ -472,15 +529,17 @@ Output Format:
 If no evidence found, return: {"found": false}
 Return valid JSON only:`
 
-          const response = await deepseek.chat.completions.create({
-            model: 'deepseek-chat',
-            messages: [
-              { role: 'system', content: 'You are a healthcare policy compliance expert.' },
-              { role: 'user', content: searchPrompt }
-            ],
-            temperature: 0.1,
-            max_tokens: 1000,
-          })
+          const response = await retryWithBackoff(() =>
+            deepseek.chat.completions.create({
+              model: 'deepseek-chat',
+              messages: [
+                { role: 'system', content: 'You are a healthcare policy compliance expert.' },
+                { role: 'user', content: searchPrompt }
+              ],
+              temperature: 0.1,
+              max_tokens: 1000,
+            })
+          )
 
           const content = response.choices[0]?.message?.content
           if (!content) continue
@@ -529,7 +588,7 @@ Return valid JSON only:`
     }
 
     // Process policies in batches with early exit optimization
-    const batchSize = 25
+    const batchSize = 10 // Reduced to prevent connection overload
     let policiesSearched = 0
 
     for (let i = 0; i < uniquePolicies.length; i += batchSize) {
@@ -625,20 +684,22 @@ export async function searchPoliciesForQuestions(
   // PHASE 4: Process each question with pre-fetched policies
   // LIMIT TO FIRST 20 QUESTIONS FOR TESTING
   const limitedSelections = categorySelections.slice(0, 20)
-  console.log(`🚀 PHASE 3: Searching ${limitedSelections.length} questions (LIMITED TO 20 FOR TESTING) using cached policies...`)
+  console.log(`🚀 PHASE 3: Searching ${limitedSelections.length} questions (LIMITED TO 20 FOR TESTING, 5 CONCURRENT) using cached policies...`)
 
-  const searchPromises = limitedSelections.map(async (selection) => {
-    console.log(`   🔎 Question ${selection.questionNumber}: Using categories [${selection.categories.join(', ')}]`)
-    const result = await searchPoliciesForEvidenceWithCache(
-      selection.questionText,
-      policiesByCategory,
-      selection.categories
-    )
-    return { questionNumber: selection.questionNumber, result }
-  })
-
-  // Wait for all questions to finish processing (in parallel)
-  const searchResults = await Promise.all(searchPromises)
+  // Process questions with concurrency limit of 5
+  const searchResults = await processConcurrently(
+    limitedSelections,
+    async (selection) => {
+      console.log(`   🔎 Question ${selection.questionNumber}: Using categories [${selection.categories.join(', ')}]`)
+      const result = await searchPoliciesForEvidenceWithCache(
+        selection.questionText,
+        policiesByCategory,
+        selection.categories
+      )
+      return { questionNumber: selection.questionNumber, result }
+    },
+    5 // Process 5 questions at a time
+  )
 
   // Convert array results back to Map
   const results = new Map<number, SearchResult>()
