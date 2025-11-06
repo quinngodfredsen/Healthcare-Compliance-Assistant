@@ -84,7 +84,7 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // Phase 1: Extract questions using DeepSeek
+    // Phase 1: Extract questions using DeepSeek with streaming
     console.log('Extracting questions with DeepSeek...')
     const extractionPrompt = `You are an expert healthcare compliance analyst. Extract all audit questions from the provided PDF text.
 
@@ -109,17 +109,27 @@ Output Format:
 
 Return valid JSON only:`
 
-    const extractionResponse = await deepseek.chat.completions.create({
+    // Use streaming for faster perceived performance
+    const stream = await deepseek.chat.completions.create({
       model: 'deepseek-chat',
       messages: [
         { role: 'system', content: 'You are a healthcare compliance expert that extracts audit questions from documents.' },
         { role: 'user', content: extractionPrompt }
       ],
       temperature: 0.1,
-      max_tokens: 8192,
+      max_tokens: 4096, // Reduced from 8192 - questions are typically short
+      stream: true,
     })
 
-    const extractedContent = extractionResponse.choices[0]?.message?.content
+    // Collect streamed response
+    let extractedContent = ''
+    for await (const chunk of stream) {
+      const content = chunk.choices[0]?.delta?.content
+      if (content) {
+        extractedContent += content
+      }
+    }
+
     if (!extractedContent) {
       throw new Error('No response from DeepSeek for question extraction')
     }
