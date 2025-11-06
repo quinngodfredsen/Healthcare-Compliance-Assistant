@@ -171,13 +171,55 @@ Return valid JSON only:`
       }
     }
 
+    // Deduplicate questions (parallel processing may create duplicates at chunk boundaries)
+    const deduplicatedQuestions: { number: number; text: string }[] = []
+    const seenTexts = new Set<string>()
+
+    for (const q of allExtractedQuestions) {
+      const normalizedText = q.text.trim().toLowerCase()
+
+      // Check for exact duplicates
+      if (seenTexts.has(normalizedText)) {
+        continue
+      }
+
+      // Check for similar questions (likely split across chunks)
+      let isDuplicate = false
+      for (const seen of seenTexts) {
+        // If texts are very similar (>80% overlap), consider it a duplicate
+        const similarity = calculateSimilarity(normalizedText, seen)
+        if (similarity > 0.8) {
+          isDuplicate = true
+          break
+        }
+      }
+
+      if (!isDuplicate) {
+        seenTexts.add(normalizedText)
+        deduplicatedQuestions.push(q)
+      }
+    }
+
     // Renumber all questions sequentially
-    const extractedQuestions = allExtractedQuestions.map((q, idx) => ({
+    const extractedQuestions = deduplicatedQuestions.map((q, idx) => ({
       number: idx + 1,
       text: q.text
     }))
 
-    console.log(`Extracted ${extractedQuestions.length} questions from ${chunks.length} chunks`)
+    console.log(`Extracted ${allExtractedQuestions.length} questions from ${chunks.length} chunks, deduplicated to ${extractedQuestions.length} unique questions`)
+
+    // Helper function to calculate text similarity
+    function calculateSimilarity(text1: string, text2: string): number {
+      const words1 = text1.split(/\s+/)
+      const words2 = text2.split(/\s+/)
+      const set1 = new Set(words1)
+      const set2 = new Set(words2)
+
+      const intersection = new Set([...set1].filter(x => set2.has(x)))
+      const union = new Set([...set1, ...set2])
+
+      return intersection.size / union.size
+    }
 
     if (extractedQuestions.length === 0) {
       return NextResponse.json(
