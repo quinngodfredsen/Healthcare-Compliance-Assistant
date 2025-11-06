@@ -78,16 +78,21 @@ export async function searchPoliciesForEvidence(
 
     console.log(`Searching ${policies.length} policies from Supabase for question...`)
 
-    // Search through each policy
-    for (const policy of policies) {
-      if (!policy.content || policy.content.length < 100) continue
+    // Search through each policy in parallel (batches of 5 to avoid overwhelming the API)
+    const batchSize = 5
+    for (let i = 0; i < policies.length; i += batchSize) {
+      const batch = policies.slice(i, i + batchSize)
 
-      // Use AI to check if this policy contains evidence for the question
-      // We'll search in chunks to avoid token limits
-      const maxChars = 15000 // Keep within token limits
-      const policyChunk = policy.content.substring(0, maxChars)
+      // Process this batch in parallel
+      const batchPromises = batch.map(async (policy) => {
+        if (!policy.content || policy.content.length < 100) return null
 
-      const searchPrompt = `You are a healthcare compliance expert. Analyze if this policy document contains evidence that answers the audit question.
+        try {
+          // Use AI to check if this policy contains evidence for the question
+          const maxChars = 15000 // Keep within token limits
+          const policyChunk = policy.content.substring(0, maxChars)
+
+          const searchPrompt = `You are a healthcare compliance expert. Analyze if this policy document contains evidence that answers the audit question.
 
 Audit Question:
 "${question}"
@@ -112,46 +117,61 @@ Output Format:
 If no evidence found, return: {"found": false}
 Return valid JSON only:`
 
-      const response = await deepseek.chat.completions.create({
-        model: 'deepseek-chat',
-        messages: [
-          { role: 'system', content: 'You are a healthcare policy compliance expert.' },
-          { role: 'user', content: searchPrompt }
-        ],
-        temperature: 0.1,
-        max_tokens: 1000,
+          const response = await deepseek.chat.completions.create({
+            model: 'deepseek-chat',
+            messages: [
+              { role: 'system', content: 'You are a healthcare policy compliance expert.' },
+              { role: 'user', content: searchPrompt }
+            ],
+            temperature: 0.1,
+            max_tokens: 1000,
+          })
+
+          const content = response.choices[0]?.message?.content
+          if (!content) return null
+
+          // Parse AI response
+          let jsonContent = content.trim()
+          if (jsonContent.startsWith('```json')) {
+            jsonContent = jsonContent.replace(/```json\s*/, '').replace(/```\s*$/, '')
+          } else if (jsonContent.startsWith('```')) {
+            jsonContent = jsonContent.replace(/```\s*/, '').replace(/```\s*$/, '')
+          }
+
+          const result = JSON.parse(jsonContent.trim())
+
+          if (result.found && result.confidence > 0.6) {
+            return {
+              policy,
+              result
+            }
+          }
+
+          return null
+        } catch (e) {
+          console.error('Error processing policy:', e)
+          return null
+        }
       })
 
-      const content = response.choices[0]?.message?.content
-      if (!content) continue
+      // Wait for this batch to complete
+      const batchResults = await Promise.all(batchPromises)
 
-      try {
-        // Parse AI response
-        let jsonContent = content.trim()
-        if (jsonContent.startsWith('```json')) {
-          jsonContent = jsonContent.replace(/```json\s*/, '').replace(/```\s*$/, '')
-        } else if (jsonContent.startsWith('```')) {
-          jsonContent = jsonContent.replace(/```\s*/, '').replace(/```\s*$/, '')
-        }
-
-        const result = JSON.parse(jsonContent.trim())
-
-        if (result.found && result.confidence > 0.6) {
+      // Check if any policy in this batch had a match
+      for (const match of batchResults) {
+        if (match) {
           return {
             status: 'met',
             evidence: {
-              policyName: policy.policy_name,
-              policyNumber: policy.policy_number,
+              policyName: match.policy.policy_name,
+              policyNumber: match.policy.policy_number,
               page: 'Various', // Could enhance to find specific page
-              excerpt: result.excerpt || 'Evidence found in policy document',
-              confidence: result.confidence,
-              category: policy.policy_category,
+              excerpt: match.result.excerpt || 'Evidence found in policy document',
+              confidence: match.result.confidence,
+              category: match.policy.policy_category,
             }
           }
         }
-      } catch (e) {
-        console.error('Error parsing AI response:', e)
-        continue
       }
     }
 
@@ -164,21 +184,33 @@ Return valid JSON only:`
   }
 }
 
-// Batch search for multiple questions (more efficient)
+// Batch search for multiple questions (parallel processing for speed)
 export async function searchPoliciesForQuestions(
   questions: { number: number; text: string }[],
   maxQuestionsToProcess: number = 10
 ): Promise<Map<number, SearchResult>> {
-  const results = new Map<number, SearchResult>()
-
   // Process a limited number of questions
   const questionsToProcess = questions.slice(0, maxQuestionsToProcess)
 
-  for (const question of questionsToProcess) {
+  console.log(`🚀 Processing ${questionsToProcess.length} questions in parallel...`)
+
+  // Process all questions in parallel using Promise.all
+  const searchPromises = questionsToProcess.map(async (question) => {
     console.log(`Searching for evidence for question ${question.number}...`)
     const result = await searchPoliciesForEvidence(question.text, 20) // Limit to 20 policies per question
-    results.set(question.number, result)
+    return { questionNumber: question.number, result }
+  })
+
+  // Wait for all questions to finish processing
+  const searchResults = await Promise.all(searchPromises)
+
+  // Convert array results back to Map
+  const results = new Map<number, SearchResult>()
+  for (const { questionNumber, result } of searchResults) {
+    results.set(questionNumber, result)
   }
+
+  console.log(`✅ Completed processing ${questionsToProcess.length} questions`)
 
   return results
 }
