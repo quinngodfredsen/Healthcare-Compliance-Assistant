@@ -84,18 +84,31 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // Phase 1: Extract questions using DeepSeek with streaming
-    console.log('Extracting questions with DeepSeek...')
-    const extractionPrompt = `You are an expert healthcare compliance analyst. Extract all audit questions from the provided PDF text.
+    // Phase 1: Extract questions using DeepSeek with parallel processing
+    console.log('Extracting questions with DeepSeek (parallel processing)...')
 
-PDF Text:
-${pdfText}
+    // Split PDF text into chunks for parallel processing
+    const CHUNK_SIZE = 5000 // characters per chunk
+    const chunks: string[] = []
+    for (let i = 0; i < pdfText.length; i += CHUNK_SIZE) {
+      chunks.push(pdfText.slice(i, i + CHUNK_SIZE))
+    }
+
+    console.log(`Split into ${chunks.length} chunks for parallel processing`)
+
+    // Process all chunks in parallel
+    const chunkPromises = chunks.map(async (chunk, index) => {
+      const extractionPrompt = `You are an expert healthcare compliance analyst. Extract all audit questions from the provided PDF text chunk.
+
+PDF Text Chunk ${index + 1}:
+${chunk}
 
 Instructions:
-- Extract ALL compliance questions from the text
+- Extract ALL compliance questions from this text chunk
 - Preserve exact wording of each question
-- Number them sequentially starting from 1
+- Number them sequentially starting from 1 for this chunk
 - Return ONLY valid JSON, no additional text
+- If the chunk starts or ends mid-question, include partial questions
 
 Output Format:
 {
@@ -109,48 +122,62 @@ Output Format:
 
 Return valid JSON only:`
 
-    // Use streaming for faster perceived performance
-    const stream = await deepseek.chat.completions.create({
-      model: 'deepseek-chat',
-      messages: [
-        { role: 'system', content: 'You are a healthcare compliance expert that extracts audit questions from documents.' },
-        { role: 'user', content: extractionPrompt }
-      ],
-      temperature: 0.1,
-      max_tokens: 4096, // Reduced from 8192 - questions are typically short
-      stream: true,
+      const stream = await deepseek.chat.completions.create({
+        model: 'deepseek-chat',
+        messages: [
+          { role: 'system', content: 'You are a healthcare compliance expert that extracts audit questions from documents.' },
+          { role: 'user', content: extractionPrompt }
+        ],
+        temperature: 0.1,
+        max_tokens: 4096,
+        stream: true,
+      })
+
+      let extractedContent = ''
+      for await (const streamChunk of stream) {
+        const content = streamChunk.choices[0]?.delta?.content
+        if (content) {
+          extractedContent += content
+        }
+      }
+
+      if (!extractedContent) {
+        throw new Error(`No response from DeepSeek for chunk ${index + 1}`)
+      }
+
+      return { index, content: extractedContent }
     })
 
-    // Collect streamed response
-    let extractedContent = ''
-    for await (const chunk of stream) {
-      const content = chunk.choices[0]?.delta?.content
-      if (content) {
-        extractedContent += content
+    // Wait for all chunks to complete
+    const chunkResults = await Promise.all(chunkPromises)
+
+    // Combine all extracted questions from chunks
+    let allExtractedQuestions: { number: number; text: string }[] = []
+    for (const result of chunkResults.sort((a, b) => a.index - b.index)) {
+      try {
+        let jsonContent = result.content.trim()
+        if (jsonContent.startsWith('```json')) {
+          jsonContent = jsonContent.replace(/```json\s*/, '').replace(/```\s*$/, '')
+        } else if (jsonContent.startsWith('```')) {
+          jsonContent = jsonContent.replace(/```\s*/, '').replace(/```\s*$/, '')
+        }
+
+        const parsed = JSON.parse(jsonContent.trim())
+        const questions = parsed.questions || []
+        allExtractedQuestions = allExtractedQuestions.concat(questions)
+      } catch (e) {
+        console.error(`Failed to parse chunk ${result.index}:`, result.content)
+        // Continue with other chunks
       }
     }
 
-    if (!extractedContent) {
-      throw new Error('No response from DeepSeek for question extraction')
-    }
+    // Renumber all questions sequentially
+    const extractedQuestions = allExtractedQuestions.map((q, idx) => ({
+      number: idx + 1,
+      text: q.text
+    }))
 
-    // Parse the extracted questions
-    let extractedQuestions: { number: number; text: string }[]
-    try {
-      // Strip markdown code blocks if present
-      let jsonContent = extractedContent.trim()
-      if (jsonContent.startsWith('```json')) {
-        jsonContent = jsonContent.replace(/```json\s*/, '').replace(/```\s*$/, '')
-      } else if (jsonContent.startsWith('```')) {
-        jsonContent = jsonContent.replace(/```\s*/, '').replace(/```\s*$/, '')
-      }
-
-      const parsed = JSON.parse(jsonContent.trim())
-      extractedQuestions = parsed.questions || []
-    } catch (e) {
-      console.error('Failed to parse DeepSeek response:', extractedContent)
-      throw new Error('Invalid response format from AI')
-    }
+    console.log(`Extracted ${extractedQuestions.length} questions from ${chunks.length} chunks`)
 
     if (extractedQuestions.length === 0) {
       return NextResponse.json(
